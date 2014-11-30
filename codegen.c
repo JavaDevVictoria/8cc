@@ -12,11 +12,13 @@ static Vector *insts = &EMPTY_VECTOR;
 static int offset;
 static FILE *out;
 
+#define NUMREGS 6
+
 static char *regs[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
 
 enum { VAR, LIT };
 enum { I32, PTR };
-enum { ADD, RET, ALLOC, LOAD, STORE };
+enum { ADD, MUL, RET, ALLOC, LOAD, STORE };
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -32,7 +34,8 @@ typedef struct {
         struct {
             int id;
             Mem *ptr;
-            char *reg;
+            int off;
+            bool spilled;
         };
         // LIT
         int val;
@@ -51,6 +54,10 @@ typedef struct {
     char *name;
     Vector *insts;
 } Func;
+
+/*
+ * Constructors
+ */
 
 static Mem* make_mem(int size) {
     Mem *r = malloc(sizeof(Mem));
@@ -94,12 +101,9 @@ static Func *make_func(Func *f) {
     return r;
 }
 
-static char *nextreg(void) {
-    static int cnt = 0;
-    if (cnt == sizeof(regs) / sizeof(regs[0]))
-        error("register exhausted");
-    return regs[cnt++];
-}
+/*
+ * Node -> Inst
+ */
 
 static void emit(Inst *in) {
     vec_push(insts, in);
@@ -137,11 +141,12 @@ static Var *walk(Node *node) {
     }
     case AST_CONV:
         return walk(node->operand);
-    case '+': {
+    case '+': case '*': {
         Var *dst = make_var(NULL);
         Var *lhs = walk(node->left);
         Var *rhs = walk(node->right);
-        emit(make_inst(&(Inst){ ADD, dst, lhs, rhs }));
+        int op = (node->kind == '+') ? ADD : MUL;
+        emit(make_inst(&(Inst){ op, dst, lhs, rhs }));
         return dst;
     }
     case AST_LITERAL:
@@ -162,10 +167,76 @@ static Func *translate(Vector *toplevels) {
     return make_func(&(Func){ name, insts });
 }
 
+/*
+ * Register allocator
+ *
+ * We don't have liveness analysis.
+ * Each temporary variable is allocated to the stack
+ * even if it's not going to be spilled.
+ * Machine registers are used as a cache.
+ */
+
+static void write_noindent(char *fmt, ...);
+static void write(char *fmt, ...);
+
+typedef struct {
+    Var *v;
+    char *reg;
+} Regmap;
+
+static Regmap reg2var[6];
+
+static void move_to_head(int i) {
+    // Avoid using struct assignment because it doesn't
+    // work with the current (old) code generator.
+    Var *v = reg2var[i].v;
+    char *reg = reg2var[i].reg;
+    for (int j = i; j > 0; j--) {
+        reg2var[j].v = reg2var[j-1].v;
+        reg2var[j].reg = reg2var[j-1].reg;
+    }
+    reg2var[0].v = v;
+    reg2var[0].reg = reg;
+}
+
+static char *regname(Var *v) {
+    // Check if it's cached
+    for (int i = 0; i < NUMREGS; i++) {
+        if (reg2var[i].v != v)
+            continue;
+        move_to_head(i);
+        return reg2var[0].reg;
+    }
+    // Look for an empty slot
+    for (int i = 0; i < NUMREGS; i++) {
+        if (reg2var[i].v)
+            continue;
+        reg2var[i].v = v;
+        reg2var[i].reg = regs[i];
+        move_to_head(i);
+        return regs[i];
+    }
+    // Spill the least-recently used variable
+    Regmap *last = &reg2var[NUMREGS - 1];
+    char *reg = last->reg;
+    write("movq %%%s, %d(%%rbp)  # spill", reg, last->v->off);
+    last->v->spilled = true;
+    if (v->spilled)
+        write("movq %d(%%rbp), %%%s  # load", v->off, reg);
+    last->v = v;
+    last->reg = reg;
+    move_to_head(NUMREGS - 1);
+    return reg;
+}
+
+/*
+ * Inst -> x86-64 assembly
+ */
+
 static char *str(Var *v) {
     switch (v->kind) {
     case VAR:
-        return format("%%%s", v->reg);
+        return format("%%%s", regname(v));
     case LIT:
         return format("$%d", v->val);
     default:
@@ -198,6 +269,10 @@ static void print(Func *f) {
             write("movq %s, %s", str(in->arg2), str(in->arg1));
             write("addq %s, %s", str(in->arg3), str(in->arg1));
             break;
+        case MUL:
+            write("movq %s, %s", str(in->arg2), str(in->arg1));
+            write("imulq %s, %s", str(in->arg3), str(in->arg1));
+            break;
         case RET:
             write("movq %s, %%rax", str(in->arg1));
             write("jmp end");
@@ -223,7 +298,8 @@ static void print(Func *f) {
 static void regalloc(void) {
     for (int i = 0; i < vec_len(vars); i++) {
         Var *v = vec_get(vars, i);
-        v->reg = nextreg();
+        offset += 8;
+        v->off = -offset;
     }
 }
 
